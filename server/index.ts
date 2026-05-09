@@ -26,6 +26,8 @@ type ThoughtRecord = {
   id: string;
   content: string;
   metadata: Record<string, unknown>;
+  brand?: string | null;
+  project?: string | null;
   created_at: string;
   updated_at?: string | null;
 };
@@ -220,9 +222,11 @@ server.registerTool(
       query: z.string().describe("What to search for"),
       limit: z.number().optional().default(10),
       threshold: z.number().optional().default(0.5),
+      brand: z.string().optional().describe("Filter results to a specific brand (e.g. producerstack)"),
+      project: z.string().optional().describe("Filter results to a specific project (e.g. seo)"),
     },
   },
-  async ({ query, limit, threshold }) => {
+  async ({ query, limit, threshold, brand, project }) => {
     try {
       const qEmb = await getEmbedding(query);
       const { data, error } = await supabase.rpc("match_thoughts", {
@@ -230,6 +234,8 @@ server.registerTool(
         match_threshold: threshold,
         match_count: limit,
         filter: {},
+        filter_brand: brand ?? null,
+        filter_project: project ?? null,
       });
 
       if (error) {
@@ -300,19 +306,23 @@ server.registerTool(
       topic: z.string().optional().describe("Filter by topic tag"),
       person: z.string().optional().describe("Filter by person mentioned"),
       days: z.number().optional().describe("Only thoughts from the last N days"),
+      brand: z.string().optional().describe("Filter by brand (e.g. producerstack)"),
+      project: z.string().optional().describe("Filter by project (e.g. seo)"),
     },
   },
-  async ({ limit, type, topic, person, days }) => {
+  async ({ limit, type, topic, person, days, brand, project }) => {
     try {
       let q = supabase
         .from("thoughts")
-        .select("content, metadata, created_at")
+        .select("content, metadata, brand, project, created_at")
         .order("created_at", { ascending: false })
         .limit(limit);
 
       if (type) q = q.contains("metadata", { type });
       if (topic) q = q.contains("metadata", { topics: [topic] });
       if (person) q = q.contains("metadata", { people: [person] });
+      if (brand) q = q.eq("brand", brand);
+      if (project) q = q.eq("project", project);
       if (days) {
         const since = new Date();
         since.setDate(since.getDate() - days);
@@ -334,12 +344,13 @@ server.registerTool(
 
       const results = data.map(
         (
-          t: { content: string; metadata: Record<string, unknown>; created_at: string },
+          t: { content: string; metadata: Record<string, unknown>; brand: string | null; project: string | null; created_at: string },
           i: number
         ) => {
           const m = t.metadata || {};
           const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""})\n   ${t.content}`;
+          const brandTag = [t.brand, t.project].filter(Boolean).join("/");
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""}${brandTag ? " | " + brandTag : ""})\n   ${t.content}`;
         }
       );
 
@@ -449,9 +460,11 @@ server.registerTool(
     },
     inputSchema: {
       content: z.string().describe("The thought to capture — a clear, standalone statement that will make sense when retrieved later by any AI"),
+      brand: z.string().optional().describe("Brand this thought belongs to (e.g. producerstack)"),
+      project: z.string().optional().describe("Project this thought belongs to (e.g. seo)"),
     },
   },
-  async ({ content }) => {
+  async ({ content, brand, project }) => {
     try {
       const [embedding, metadata] = await Promise.all([
         getEmbedding(content),
@@ -483,6 +496,24 @@ server.registerTool(
         };
       }
 
+      if (brand || project) {
+        const brandUpdate: Record<string, string> = {};
+        if (brand) brandUpdate.brand = brand;
+        if (project) brandUpdate.project = project;
+
+        const { error: brandError } = await supabase
+          .from("thoughts")
+          .update(brandUpdate)
+          .eq("id", thoughtId);
+
+        if (brandError) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to save brand/project: ${brandError.message}` }],
+            isError: true,
+          };
+        }
+      }
+
       const meta = metadata as Record<string, unknown>;
       let confirmation = `Captured as ${meta.type || "thought"}`;
       if (Array.isArray(meta.topics) && meta.topics.length)
@@ -491,6 +522,8 @@ server.registerTool(
         confirmation += ` | People: ${(meta.people as string[]).join(", ")}`;
       if (Array.isArray(meta.action_items) && meta.action_items.length)
         confirmation += ` | Actions: ${(meta.action_items as string[]).join("; ")}`;
+      if (brand || project)
+        confirmation += ` | Brand: ${[brand, project].filter(Boolean).join("/")}`;
 
       return {
         content: [{ type: "text" as const, text: confirmation }],
