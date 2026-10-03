@@ -65,6 +65,23 @@ async function getEmbedding(text: string): Promise<number[]> {
   return d.data[0].embedding;
 }
 
+const PEOPLE_REGISTRY: Record<string, string> = {
+  "martin": "Martin Riley",
+  "martin riley": "Martin Riley",
+  "paul": "Paul Billington",
+  "paul billington": "Paul Billington",
+  "ange": "Ange Riley",
+  "ange riley": "Ange Riley",
+};
+
+function normalizePeople(people: unknown): string[] {
+  if (!Array.isArray(people)) return [];
+  return people.map((name) => {
+    if (typeof name !== "string") return String(name);
+    return PEOPLE_REGISTRY[name.trim().toLowerCase()] ?? name;
+  });
+}
+
 async function extractMetadata(text: string): Promise<Record<string, unknown>> {
   const r = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
     method: "POST",
@@ -92,7 +109,9 @@ Only extract what's explicitly there.`,
   });
   const d = await r.json();
   try {
-    return JSON.parse(d.choices[0].message.content);
+    const meta = JSON.parse(d.choices[0].message.content);
+    meta.people = normalizePeople(meta.people);
+    return meta;
   } catch {
     return { topics: ["uncategorized"], type: "observation" };
   }
@@ -259,6 +278,7 @@ server.registerTool(
           const m = t.metadata || {};
           const parts = [
             `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
+            `ID: ${t.id}`,
             `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
             `Type: ${m.type || "unknown"}`,
           ];
@@ -314,7 +334,7 @@ server.registerTool(
     try {
       let q = supabase
         .from("thoughts")
-        .select("content, metadata, brand, project, created_at")
+        .select("id, content, metadata, brand, project, created_at")
         .order("created_at", { ascending: false })
         .limit(limit);
 
@@ -344,13 +364,13 @@ server.registerTool(
 
       const results = data.map(
         (
-          t: { content: string; metadata: Record<string, unknown>; brand: string | null; project: string | null; created_at: string },
+          t: { id: string; content: string; metadata: Record<string, unknown>; brand: string | null; project: string | null; created_at: string },
           i: number
         ) => {
           const m = t.metadata || {};
           const tags = Array.isArray(m.topics) ? (m.topics as string[]).join(", ") : "";
           const brandTag = [t.brand, t.project].filter(Boolean).join("/");
-          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " - " + tags : ""}${brandTag ? " | " + brandTag : ""})\n   ${t.content}`;
+          return `${i + 1}. [${new Date(t.created_at).toLocaleDateString()}] ID: ${t.id} (${m.type || "??"}${tags ? " - " + tags : ""}${brandTag ? " | " + brandTag : ""})\n   ${t.content}`;
         }
       );
 
@@ -537,6 +557,151 @@ server.registerTool(
   }
 );
 
+// Tool 6: Delete Thought
+server.registerTool(
+  "delete_thought",
+  {
+    title: "Delete Thought",
+    description:
+      "Permanently delete a thought from Open Brain by ID. Requires a confirm_content safety check — the first 50 characters of the thought content must match exactly to prevent accidental deletion. Always fetch or list the thought first to confirm the ID and content before calling this.",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      id: z.string().describe("The UUID of the thought to delete"),
+      confirm_content: z.string().describe("The first 50 characters of the thought content — must match exactly as a safety check"),
+    },
+  },
+  async ({ id, confirm_content }) => {
+    try {
+      const { data, error: fetchError } = await supabase
+        .from("thoughts")
+        .select("id, content")
+        .eq("id", id)
+        .single();
+
+      if (fetchError || !data) {
+        return {
+          content: [{ type: "text" as const, text: `Error: thought ${id} not found.` }],
+          isError: true,
+        };
+      }
+
+      const actualStart = data.content.slice(0, 50);
+      if (actualStart !== confirm_content) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Safety check failed. Expected content to start with:\n"${confirm_content}"\n\nActual content starts with:\n"${actualStart}"\n\nNo deletion performed.`,
+          }],
+          isError: true,
+        };
+      }
+
+      const { error: deleteError } = await supabase
+        .from("thoughts")
+        .delete()
+        .eq("id", id);
+
+      if (deleteError) {
+        return {
+          content: [{ type: "text" as const, text: `Delete failed: ${deleteError.message}` }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Deleted thought ${id} — "${actualStart}..."` }],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
+// Tool 7: Update Thought
+server.registerTool(
+  "update_thought",
+  {
+    title: "Update Thought",
+    description:
+      "Update the content of an existing thought in Open Brain. Requires a confirm_content safety check — the first 50 characters of the current content must match exactly. Regenerates the embedding and metadata automatically. Use for merging duplicates, correcting stale information, or reclassifying.",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    },
+    inputSchema: {
+      id: z.string().describe("The UUID of the thought to update"),
+      confirm_content: z.string().describe("The first 50 characters of the CURRENT content — safety check to confirm correct thought"),
+      new_content: z.string().describe("The new content to replace the existing thought with"),
+    },
+  },
+  async ({ id, confirm_content, new_content }) => {
+    try {
+      const { data, error: fetchError } = await supabase
+        .from("thoughts")
+        .select("id, content")
+        .eq("id", id)
+        .single();
+
+      if (fetchError || !data) {
+        return {
+          content: [{ type: "text" as const, text: `Error: thought ${id} not found.` }],
+          isError: true,
+        };
+      }
+
+      const actualStart = data.content.slice(0, 50);
+      if (actualStart !== confirm_content) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Safety check failed. Expected content to start with:\n"${confirm_content}"\n\nActual content starts with:\n"${actualStart}"\n\nNo update performed.`,
+          }],
+          isError: true,
+        };
+      }
+
+      const [newEmbedding, newMetadata] = await Promise.all([
+        getEmbedding(new_content),
+        extractMetadata(new_content),
+      ]);
+
+      const { error: updateError } = await supabase
+        .from("thoughts")
+        .update({
+          content: new_content,
+          embedding: newEmbedding,
+          metadata: { ...newMetadata, source: "mcp" },
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", id);
+
+      if (updateError) {
+        return {
+          content: [{ type: "text" as const, text: `Update failed: ${updateError.message}` }],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: `Updated thought ${id}. New content: "${new_content.slice(0, 80)}..."` }],
+      };
+    } catch (err: unknown) {
+      return {
+        content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }],
+        isError: true,
+      };
+    }
+  }
+);
+
 // --- Hono App with Auth + CORS ---
 
 const corsHeaders = {
@@ -552,11 +717,29 @@ app.options("*", (c) => {
   return c.text("ok", 200, corsHeaders);
 });
 
+// OAuth discovery probes must NOT be swallowed by the auth middleware below.
+// This server authenticates with a static key and has no OAuth authorization
+// server behind it. Answering these paths with 401 made clients believe an OAuth
+// provider existed, so they attempted dynamic client registration and failed with
+// "Couldn't register with open-brain's sign-in service". A clean 404 tells the
+// client there is no OAuth here, which is the truth.
+// NB: the function is mounted at /functions/v1/open-brain-mcp, so probes arrive as
+// /functions/v1/open-brain-mcp/.well-known/... — match on the segment, not a root path.
+app.all("*", async (c, next) => {
+  if (new URL(c.req.url).pathname.includes("/.well-known/")) {
+    return c.json({ error: "No OAuth provider — this server uses a static access key" }, 404, corsHeaders);
+  }
+  await next();
+});
+
 app.all("*", async (c) => {
   // Accept access key via header OR URL query parameter
   const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
   if (!provided || provided !== MCP_ACCESS_KEY) {
-    return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
+    // 403, not 401. A 401 is an invitation to authenticate and makes MCP clients
+    // start OAuth discovery/registration against endpoints that do not exist.
+    // 403 says "not allowed" with no auth negotiation implied.
+    return c.json({ error: "Invalid or missing access key" }, 403, corsHeaders);
   }
 
   // Fix: Claude Desktop connectors don't send the Accept header that
